@@ -1,6 +1,7 @@
 import Cocoa
 import Quartz
 import ServiceManagement
+import Carbon.HIToolbox
 
 func t(_ key: String) -> String {
     return NSLocalizedString(key, comment: "")
@@ -30,6 +31,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     var unlockedAt = 0.0
     var inScreensaver = false
     var lastRSSI: Int? = nil
+    let mediaKeyPlayPause: Int32 = 16
+    var displaySleepTimer: Timer?
+    var displaySleepRetryTimer: Timer?
+    var displaySleepRequestID = 0
+    var lockSequenceActive = false
+    var pendingUnlockAttempt = false
 
     func menuWillOpen(_ menu: NSMenu) {
         if menu == deviceMenu {
@@ -177,18 +184,171 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         try? process.run()
     }
 
-    func pauseNowPlaying() {
-        guard prefs.bool(forKey: "pauseItunes") else { return }
-        MRMediaRemoteGetNowPlayingApplicationIsPlaying(
-            DispatchQueue.main,
-            { (playing) in
-                self.nowPlayingWasPlaying = playing
-                if self.nowPlayingWasPlaying {
-                    print("pause")
-                    MRMediaRemoteSendCommand(MRCommandPause, nil)
+    func getNowPlayingIsPlaying(_ completion: @escaping (Bool) -> Void) {
+        MRMediaRemoteGetNowPlayingApplicationIsPlaying(DispatchQueue.main) { playing in
+            completion(playing)
+        }
+    }
+
+    func getNowPlayingPlaybackRate(_ completion: @escaping (Double?) -> Void) {
+        MRMediaRemoteGetNowPlayingInfo(DispatchQueue.main) { info in
+            guard let dict = info as? [AnyHashable: Any] else {
+                completion(nil)
+                return
+            }
+            for key in ["kMRMediaRemoteNowPlayingInfoPlaybackRate", "PlaybackRate"] {
+                if let number = dict[key] as? NSNumber {
+                    completion(number.doubleValue)
+                    return
                 }
             }
+            for (key, value) in dict {
+                if String(describing: key).localizedCaseInsensitiveContains("PlaybackRate"),
+                   let number = value as? NSNumber {
+                    completion(number.doubleValue)
+                    return
+                }
+            }
+            completion(nil)
+        }
+    }
+
+    func detectNowPlayingState(_ completion: @escaping (Bool, Bool) -> Void) {
+        getNowPlayingIsPlaying { playing in
+            if playing {
+                completion(true, true)
+                return
+            }
+            self.getNowPlayingPlaybackRate { rate in
+                if let r = rate {
+                    completion(r > 0, true)
+                } else {
+                    completion(false, false)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    func sendNowPlayingCommand(_ command: MRCommand, name: String) -> Bool {
+        let ok = MRMediaRemoteSendCommand(command, nil)
+        print("MediaRemote \(name): \(ok ? "ok" : "failed")")
+        return ok
+    }
+
+    func sendPlayPauseMediaKey() {
+        let keyDownData1 = Int((mediaKeyPlayPause << 16) | (0xA << 8))
+        let keyUpData1 = Int((mediaKeyPlayPause << 16) | (0xB << 8))
+
+        let keyDown = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: NSPoint.zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 0xA00),
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: Int16(8),
+            data1: keyDownData1,
+            data2: -1
         )
+        let keyUp = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: NSPoint.zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 0xB00),
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            subtype: Int16(8),
+            data1: keyUpData1,
+            data2: -1
+        )
+        keyDown?.cgEvent?.post(tap: CGEventTapLocation.cghidEventTap)
+        keyUp?.cgEvent?.post(tap: CGEventTapLocation.cghidEventTap)
+        print("Sent play/pause media key fallback")
+    }
+
+    func requestDisplaySleepViaPMSet() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
+        process.arguments = ["displaysleepnow"]
+        do {
+            try process.run()
+            print("Requested display sleep via pmset fallback")
+        } catch {
+            print("Failed pmset displaysleepnow: \(error)")
+        }
+    }
+
+    func cancelPendingDisplaySleepRequests() {
+        displaySleepTimer?.invalidate()
+        displaySleepTimer = nil
+        displaySleepRetryTimer?.invalidate()
+        displaySleepRetryTimer = nil
+        displaySleepRequestID += 1
+    }
+
+    func canExecuteDisplaySleep(useScreensaver: Bool, requestID: Int) -> Bool {
+        guard requestID == displaySleepRequestID else { return false }
+        guard lockSequenceActive else { return false }
+        guard !ble.presence else { return false }
+        if useScreensaver {
+            return inScreensaver
+        }
+        return isScreenLocked()
+    }
+
+    func fallbackToggleNowPlaying(after delay: TimeInterval, expectPlaying: Bool) {
+        Timer.scheduledTimer(withTimeInterval: delay, repeats: false, block: { _ in
+            self.getNowPlayingIsPlaying { isPlaying in
+                guard isPlaying != expectPlaying else { return }
+                print("Now playing state mismatch. expected=\(expectPlaying) actual=\(isPlaying)")
+
+                if !self.sendNowPlayingCommand(MRCommandTogglePlayPause, name: "toggle") {
+                    self.sendPlayPauseMediaKey()
+                    return
+                }
+
+                Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false, block: { _ in
+                    self.getNowPlayingIsPlaying { toggledState in
+                        guard toggledState != expectPlaying else { return }
+                        self.sendPlayPauseMediaKey()
+                    }
+                })
+            }
+        })
+    }
+
+    func pauseNowPlaying(_ completion: (() -> Void)? = nil) {
+        guard prefs.bool(forKey: "pauseItunes") else {
+            completion?()
+            return
+        }
+        detectNowPlayingState { playing, confident in
+            self.nowPlayingWasPlaying = playing
+
+            // Always issue pause once. Some players are controllable from Control Center
+            // but may not report the playing state through the old boolean API.
+            print("pause")
+            var pausedByCommand = self.sendNowPlayingCommand(MRCommandPause, name: "pause")
+            if !pausedByCommand {
+                pausedByCommand = self.sendNowPlayingCommand(MRCommandTogglePlayPause, name: "toggle")
+            }
+            if !pausedByCommand {
+                self.sendPlayPauseMediaKey()
+                pausedByCommand = true
+            }
+
+            if self.nowPlayingWasPlaying || !confident {
+                self.fallbackToggleNowPlaying(after: 0.35, expectPlaying: false)
+            }
+            if !self.nowPlayingWasPlaying && !confident && pausedByCommand {
+                print("Playback state uncertain; scheduling resume on unlock")
+                self.nowPlayingWasPlaying = true
+            }
+            Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false, block: { _ in
+                completion?()
+            })
+        }
     }
     
     func playNowPlaying() {
@@ -196,22 +356,66 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         if nowPlayingWasPlaying {
             print("play")
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { _ in
-                MRMediaRemoteSendCommand(MRCommandPlay, nil)
+                if !self.sendNowPlayingCommand(MRCommandPlay, name: "play") {
+                    self.sendPlayPauseMediaKey()
+                }
+                // Do a gentle retry with Play only (no toggle) to avoid
+                // play->toggle interruptions when the state callback lags.
+                Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false, block: { _ in
+                    self.getNowPlayingIsPlaying { isPlaying in
+                        guard !isPlaying else { return }
+                        if !self.sendNowPlayingCommand(MRCommandPlay, name: "play-retry") {
+                            self.sendPlayPauseMediaKey()
+                        }
+                    }
+                })
                 self.nowPlayingWasPlaying = false
             })
         }
     }
 
     func lockOrSaveScreen() {
-        if prefs.bool(forKey: "screensaver") {
+        let useScreensaver = prefs.bool(forKey: "screensaver")
+        let shouldSleepDisplay = prefs.bool(forKey: "sleepDisplay")
+        lockSequenceActive = true
+
+        if useScreensaver {
             NSWorkspace.shared.launchApplication("ScreenSaverEngine")
         } else {
             if SACLockScreenImmediate() != 0 {
                 print("Failed to lock screen")
             }
-            if prefs.bool(forKey: "sleepDisplay") {
-                print("sleep display")
-                sleepDisplay()
+        }
+
+        if shouldSleepDisplay {
+            cancelPendingDisplaySleepRequests()
+            let requestID = displaySleepRequestID
+            if useScreensaver {
+                // For screensaver mode: keep screensaver first, then sleep display once after 3s.
+                displaySleepTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false, block: { _ in
+                    guard self.canExecuteDisplaySleep(useScreensaver: true, requestID: requestID) else { return }
+                    print("sleep display (screensaver mode)")
+                    sleepDisplay()
+                    if !self.displaySleep {
+                        self.requestDisplaySleepViaPMSet()
+                    }
+                })
+            } else {
+                displaySleepTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false, block: { _ in
+                    guard self.canExecuteDisplaySleep(useScreensaver: false, requestID: requestID) else { return }
+
+                    print("sleep display")
+                    sleepDisplay()
+                    // Tahoe sometimes drops the first request during lock transition.
+                    self.displaySleepRetryTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false, block: { _ in
+                        guard self.canExecuteDisplaySleep(useScreensaver: false, requestID: requestID) else { return }
+
+                        sleepDisplay()
+                        if !self.displaySleep {
+                            self.requestDisplaySleepViaPMSet()
+                        }
+                    })
+                })
             }
         }
     }
@@ -219,6 +423,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     func updatePresence(presence: Bool, reason: String) {
         if presence {
             if ble.unlockRSSI != ble.UNLOCK_DISABLED {
+                cancelPendingDisplaySleepRequests()
+                if !isScreenLocked() && !inScreensaver {
+                    lockSequenceActive = false
+                }
                 if let un = userNotification {
                     NSUserNotificationCenter.default.removeDeliveredNotification(un)
                     userNotification = nil
@@ -234,14 +442,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
                 tryUnlockScreen()
             }
         } else {
-            if (!isScreenLocked() && ble.lockRSSI != ble.LOCK_DISABLED) {
-                pauseNowPlaying()
-                lockOrSaveScreen()
-                notifyUser(reason)
-                runScript(reason)
+            if !lockSequenceActive && !isScreenLocked() && !inScreensaver && !displaySleep && ble.lockRSSI != ble.LOCK_DISABLED {
+                pauseNowPlaying {
+                    self.lockOrSaveScreen()
+                    self.notifyUser(reason)
+                    self.runScript(reason)
+                }
             }
             manualLock = false
         }
+    }
+
+    func postKeyPress(_ keyCode: CGKeyCode) {
+        let src = CGEventSource(stateID: .hidSystemState)
+        CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: true)?.post(tap: .cghidEventTap)
+        CGEvent(keyboardEventSource: src, virtualKey: keyCode, keyDown: false)?.post(tap: .cghidEventTap)
     }
 
     func fakeKeyStrokes(_ string: String) {
@@ -261,11 +476,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             pressEvent?.keyboardSetUnicodeString(stringLength: len, unicodeString: buffer)
             pressEvent?.post(tap: .cghidEventTap)
             CGEvent(keyboardEventSource: src, virtualKey: 49, keyDown: false)?.post(tap: .cghidEventTap)
+            buffer.deallocate()
         }
         
-        // Return key
-        CGEvent(keyboardEventSource: src, virtualKey: 52, keyDown: true)?.post(tap: .cghidEventTap)
-        CGEvent(keyboardEventSource: src, virtualKey: 52, keyDown: false)?.post(tap: .cghidEventTap)
+        // Press both Return and keypad Enter for better compatibility on Tahoe lock screen.
+        postKeyPress(CGKeyCode(kVK_Return))
+        postKeyPress(CGKeyCode(kVK_ANSI_KeypadEnter))
     }
 
     func isScreenLocked() -> Bool {
@@ -283,26 +499,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         guard ble.unlockRSSI != ble.UNLOCK_DISABLED else { return }
         guard !systemSleep else { return }
         guard !displaySleep else { return }
-
-        if inScreensaver {
-            // In screensaver, make sure Login panel is displayed
-            let src = CGEventSource(stateID: .hidSystemState)
-            // Esc key down and up
-            CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: true)?.post(tap: .cghidEventTap)
-            CGEvent(keyboardEventSource: src, virtualKey: 0x35, keyDown: false)?.post(tap: .cghidEventTap)
-        }
+        guard !pendingUnlockAttempt else { return }
 
         guard !self.prefs.bool(forKey: "wakeWithoutUnlocking") else { return }
 
+        pendingUnlockAttempt = true
         Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { _ in
-            guard self.isScreenLocked() else { return }
-            guard let password = self.fetchPassword(warn: true) else { return }
-            
-            print("Entering password")
-            self.unlockedAt = Date().timeIntervalSince1970
-            self.fakeKeyStrokes(password)
-            self.playNowPlaying()
-            self.runScript("unlocked")
+            self.pendingUnlockAttempt = false
+            guard self.isScreenLocked() || self.inScreensaver else { return }
+
+            let inputPassword = {
+                guard let password = self.fetchPassword(warn: true) else { return }
+                print("Entering password")
+                self.unlockedAt = Date().timeIntervalSince1970
+                self.fakeKeyStrokes(password)
+                self.runScript("unlocked")
+            }
+
+            if self.inScreensaver {
+                // In screensaver mode, first reveal the login panel.
+                self.postKeyPress(CGKeyCode(kVK_Shift))
+                Timer.scheduledTimer(withTimeInterval: 0.35, repeats: false, block: { _ in
+                    guard self.ble.presence else { return }
+                    guard !self.displaySleep else { return }
+                    guard !self.systemSleep else { return }
+                    guard self.isScreenLocked() || self.inScreensaver else { return }
+                    inputPassword()
+                })
+                return
+            }
+
+            inputPassword()
         })
     }
 
@@ -310,6 +537,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         print("display wake")
         //unlockedAt = Date().timeIntervalSince1970
         displaySleep = false
+        cancelPendingDisplaySleepRequests()
         wakeTimer?.invalidate()
         wakeTimer = nil
         tryUnlockScreen()
@@ -340,12 +568,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     }
 
     @objc func onUnlock() {
+        cancelPendingDisplaySleepRequests()
+        pendingUnlockAttempt = false
+        lockSequenceActive = false
         Timer.scheduledTimer(withTimeInterval: 2, repeats: false, block: { _ in
             print("onUnlock")
-            if Date().timeIntervalSince1970 >= self.unlockedAt + 10 {
+            let autoUnlockRecently = Date().timeIntervalSince1970 < self.unlockedAt + 10
+            if !autoUnlockRecently {
                 if self.ble.unlockRSSI != self.ble.UNLOCK_DISABLED {
                     self.runScript("intruded")
                 }
+            }
+            if self.nowPlayingWasPlaying {
                 self.playNowPlaying()
             }
         })
@@ -363,6 +597,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     @objc func onScreensaverStop() {
         print("screensaver stop")
         inScreensaver = false
+        cancelPendingDisplaySleepRequests()
     }
 
     @objc func selectDevice(item: NSMenuItem) {
@@ -555,8 +790,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     @objc func lockNow() {
         guard !isScreenLocked() else { return }
         manualLock = true
-        pauseNowPlaying()
-        lockOrSaveScreen()
+        pauseNowPlaying {
+            self.lockOrSaveScreen()
+        }
     }
     
     @objc func showAboutBox() {
