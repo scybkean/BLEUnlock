@@ -9,6 +9,18 @@ func t(_ key: String) -> String {
 
 @NSApplicationMain
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation, NSUserNotificationCenterDelegate, BLEDelegate {
+    struct IconPoint {
+        let x: Int
+        let y: Int
+    }
+
+    struct NowPlayingIconMask {
+        let size: Int
+        let ringPoints: [IconPoint]
+        let trianglePoints: [IconPoint]
+        let backgroundPoints: [IconPoint]
+    }
+
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let ble = BLE()
     let mainMenu = NSMenu()
@@ -32,11 +44,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
     var inScreensaver = false
     var lastRSSI: Int? = nil
     let mediaKeyPlayPause: Int32 = 16
+    let nowPlayingIconMasks: [NowPlayingIconMask] = AppDelegate.makeNowPlayingIconMasks()
     var displaySleepTimer: Timer?
     var displaySleepRetryTimer: Timer?
     var displaySleepRequestID = 0
     var lockSequenceActive = false
     var pendingUnlockAttempt = false
+    var nowPlayingIconDetectedOnLock = false
+    var nowPlayingResumePendingFromUncertainState = false
+    var screenCaptureAccessRequestTriggered = false
+    var screenCapturePermissionGuideShown = false
 
     func menuWillOpen(_ menu: NSMenu) {
         if menu == deviceMenu {
@@ -190,6 +207,261 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
         }
     }
 
+    static func pointInTriangle(x: Double, y: Double, a: (Double, Double), b: (Double, Double), c: (Double, Double)) -> Bool {
+        let p = (x, y)
+        let sign = { (p1: (Double, Double), p2: (Double, Double), p3: (Double, Double)) -> Double in
+            return (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1)
+        }
+        let d1 = sign(p, a, b)
+        let d2 = sign(p, b, c)
+        let d3 = sign(p, c, a)
+        let hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0)
+        let hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0)
+        return !(hasNeg && hasPos)
+    }
+
+    static func makeNowPlayingIconMasks() -> [NowPlayingIconMask] {
+        var masks: [NowPlayingIconMask] = []
+        for size in 14...21 {
+            var ringPoints: [IconPoint] = []
+            var trianglePoints: [IconPoint] = []
+            var backgroundPoints: [IconPoint] = []
+
+            let center = (Double(size) - 1.0) / 2.0
+            let outerRadius = Double(size) * 0.46
+            let innerRadius = Double(size) * 0.31
+            let triangleA = (Double(size) * 0.42, Double(size) * 0.30)
+            let triangleB = (Double(size) * 0.42, Double(size) * 0.70)
+            let triangleC = (Double(size) * 0.72, Double(size) * 0.50)
+
+            for y in 0..<size {
+                for x in 0..<size {
+                    let px = Double(x) + 0.5
+                    let py = Double(y) + 0.5
+                    let d = hypot(px - center, py - center)
+                    let point = IconPoint(x: x, y: y)
+
+                    if d <= outerRadius && d >= innerRadius {
+                        ringPoints.append(point)
+                        continue
+                    }
+                    if pointInTriangle(x: px, y: py, a: triangleA, b: triangleB, c: triangleC) {
+                        trianglePoints.append(point)
+                        continue
+                    }
+                    if d <= innerRadius - 1.0 || (d >= outerRadius + 0.8 && d <= outerRadius + 2.2) {
+                        backgroundPoints.append(point)
+                    }
+                }
+            }
+
+            guard !ringPoints.isEmpty, !trianglePoints.isEmpty, !backgroundPoints.isEmpty else { continue }
+            masks.append(NowPlayingIconMask(size: size, ringPoints: ringPoints, trianglePoints: trianglePoints, backgroundPoints: backgroundPoints))
+        }
+        return masks
+    }
+
+    func openScreenCaptureSettings() {
+        let candidates = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension",
+        ]
+        for raw in candidates {
+            guard let url = URL(string: raw) else { continue }
+            if NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+        print("Failed to open Screen Recording settings URL")
+    }
+
+    func showScreenCapturePermissionGuideIfNeeded() {
+        guard !screenCapturePermissionGuideShown else { return }
+        screenCapturePermissionGuideShown = true
+
+        let msg = NSAlert()
+        msg.messageText = "Screen Recording permission is required"
+        msg.informativeText = "To use \"Pause \\\"Now Playing\\\" while Locked\", allow BLEUnlock in:\n\nSystem Settings > Privacy & Security > Screen Recording\n\nAfter granting permission, quit and reopen BLEUnlock."
+        msg.alertStyle = .warning
+        msg.addButton(withTitle: "Open System Settings")
+        msg.addButton(withTitle: "Later")
+        msg.window.title = "BLEUnlock"
+        NSApp.activate(ignoringOtherApps: true)
+
+        if msg.runModal() == .alertFirstButtonReturn {
+            openScreenCaptureSettings()
+        }
+    }
+
+    func ensureScreenCaptureAccessForNowPlaying() -> Bool {
+        if #available(macOS 10.15, *) {
+            if CGPreflightScreenCaptureAccess() {
+                return true
+            }
+            if !screenCaptureAccessRequestTriggered {
+                screenCaptureAccessRequestTriggered = true
+                print("Requesting Screen Recording permission for Now Playing icon detection.")
+                if CGRequestScreenCaptureAccess() {
+                    return true
+                }
+            }
+            if CGPreflightScreenCaptureAccess() {
+                return true
+            }
+            showScreenCapturePermissionGuideIfNeeded()
+            return false
+        }
+        return false
+    }
+
+    func grayscalePixels(from image: CGImage) -> (pixels: [UInt8], width: Int, height: Int)? {
+        let width = image.width
+        let height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height)
+        let rendered = pixels.withUnsafeMutableBytes { rawBuffer in
+            guard let base = rawBuffer.baseAddress else { return false }
+            guard let context = CGContext(
+                data: base,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else {
+                return false
+            }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard rendered else { return nil }
+        return (pixels, width, height)
+    }
+
+    func sampleMean(_ points: [IconPoint], atX x: Int, y: Int, pixels: [UInt8], width: Int) -> Double {
+        var total = 0.0
+        for point in points {
+            total += Double(pixels[(y + point.y) * width + (x + point.x)])
+        }
+        return total / Double(points.count)
+    }
+
+    func sampleRatio(_ points: [IconPoint], atX x: Int, y: Int, pixels: [UInt8], width: Int, matcher: (Double) -> Bool) -> Double {
+        var matched = 0
+        for point in points {
+            let value = Double(pixels[(y + point.y) * width + (x + point.x)])
+            if matcher(value) {
+                matched += 1
+            }
+        }
+        return Double(matched) / Double(points.count)
+    }
+
+    func matchesNowPlayingIconMask(_ mask: NowPlayingIconMask, atX x: Int, y: Int, pixels: [UInt8], width: Int) -> Bool {
+        let ringMean = sampleMean(mask.ringPoints, atX: x, y: y, pixels: pixels, width: width)
+        let triangleMean = sampleMean(mask.trianglePoints, atX: x, y: y, pixels: pixels, width: width)
+        let bgMean = sampleMean(mask.backgroundPoints, atX: x, y: y, pixels: pixels, width: width)
+
+        let fgWeight = Double(mask.ringPoints.count + mask.trianglePoints.count)
+        let fgMean = (ringMean * Double(mask.ringPoints.count) + triangleMean * Double(mask.trianglePoints.count)) / fgWeight
+        let contrast = abs(fgMean - bgMean)
+        guard contrast >= 30.0 else { return false }
+
+        let brightIcon = fgMean > bgMean
+        let delta = max(8.0, contrast * 0.24)
+        let ringRatio = sampleRatio(mask.ringPoints, atX: x, y: y, pixels: pixels, width: width) { value in
+            brightIcon ? (value >= bgMean + delta) : (value <= bgMean - delta)
+        }
+        guard ringRatio >= 0.62 else { return false }
+
+        let triangleRatio = sampleRatio(mask.trianglePoints, atX: x, y: y, pixels: pixels, width: width) { value in
+            brightIcon ? (value >= bgMean + delta) : (value <= bgMean - delta)
+        }
+        guard triangleRatio >= 0.58 else { return false }
+
+        let backgroundRatio = sampleRatio(mask.backgroundPoints, atX: x, y: y, pixels: pixels, width: width) { value in
+            brightIcon ? (value <= fgMean - delta) : (value >= fgMean + delta)
+        }
+        return backgroundRatio >= 0.56
+    }
+
+    func containsNowPlayingIcon(in image: CGImage) -> Bool {
+        guard let gray = grayscalePixels(from: image) else { return false }
+        let width = gray.width
+        let height = gray.height
+        let pixels = gray.pixels
+
+        for mask in nowPlayingIconMasks {
+            guard width >= mask.size, height >= mask.size else { continue }
+            let maxX = width - mask.size
+            let maxY = height - mask.size
+            for y in 0...maxY {
+                for x in 0...maxX {
+                    if matchesNowPlayingIconMask(mask, atX: x, y: y, pixels: pixels, width: width) {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    func isNowPlayingIconVisibleInMenuBar() -> Bool {
+        guard ensureScreenCaptureAccessForNowPlaying() else {
+            print("Skip Now Playing control: screen recording permission is not granted.")
+            return false
+        }
+
+        let displayID = CGMainDisplayID()
+        let displayWidth = Int(CGDisplayPixelsWide(displayID))
+        let displayHeight = Int(CGDisplayPixelsHigh(displayID))
+        guard displayWidth > 0, displayHeight > 0 else { return false }
+
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let searchWidth = min(Int(460 * scale), displayWidth)
+        let menuBarHeight = max(Int(ceil(NSStatusBar.system.thickness * scale)), 1)
+        let searchHeight = min(max(menuBarHeight + Int(10 * scale), menuBarHeight), displayHeight)
+
+        let topRightRect = CGRect(
+            x: CGFloat(displayWidth - searchWidth),
+            y: 0,
+            width: CGFloat(searchWidth),
+            height: CGFloat(searchHeight)
+        )
+        let bottomRightRect = CGRect(
+            x: CGFloat(displayWidth - searchWidth),
+            y: CGFloat(displayHeight - searchHeight),
+            width: CGFloat(searchWidth),
+            height: CGFloat(searchHeight)
+        )
+
+        if let topImage = CGDisplayCreateImage(displayID, rect: topRightRect), containsNowPlayingIcon(in: topImage) {
+            return true
+        }
+        if let bottomImage = CGDisplayCreateImage(displayID, rect: bottomRightRect), containsNowPlayingIcon(in: bottomImage) {
+            return true
+        }
+        return false
+    }
+
+    func detectNowPlayingIconVisibleWithRetry(context: String, retries: Int, interval: TimeInterval, completion: @escaping (Bool) -> Void) {
+        let maxRetries = max(retries, 0)
+        func attempt(_ remainingRetries: Int, attemptNumber: Int) {
+            let visible = isNowPlayingIconVisibleInMenuBar()
+            print("Now Playing menu icon visible \(context) [attempt \(attemptNumber)]: \(visible)")
+            if visible || remainingRetries == 0 {
+                completion(visible)
+                return
+            }
+            Timer.scheduledTimer(withTimeInterval: interval, repeats: false, block: { _ in
+                attempt(remainingRetries - 1, attemptNumber: attemptNumber + 1)
+            })
+        }
+        attempt(maxRetries, attemptNumber: 1)
+    }
+
     func getNowPlayingPlaybackRate(_ completion: @escaping (Double?) -> Void) {
         MRMediaRemoteGetNowPlayingInfo(DispatchQueue.main) { info in
             guard let dict = info as? [AnyHashable: Any] else {
@@ -226,6 +498,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
                     completion(false, false)
                 }
             }
+        }
+    }
+
+    func hasNowPlayingContext(_ completion: @escaping (Bool) -> Void) {
+        MRMediaRemoteGetNowPlayingInfo(DispatchQueue.main) { info in
+            guard let dict = info as? [AnyHashable: Any], !dict.isEmpty else {
+                completion(false)
+                return
+            }
+
+            let stringKeys = [
+                "kMRMediaRemoteNowPlayingInfoTitle", "Title",
+                "kMRMediaRemoteNowPlayingInfoArtist", "Artist",
+                "kMRMediaRemoteNowPlayingInfoAlbum", "Album",
+            ]
+            for key in stringKeys {
+                if let value = dict[key] as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    completion(true)
+                    return
+                }
+            }
+
+            let numericKeys = [
+                "kMRMediaRemoteNowPlayingInfoDuration", "Duration",
+                "kMRMediaRemoteNowPlayingInfoElapsedTime", "ElapsedTime",
+            ]
+            for key in numericKeys {
+                if let number = dict[key] as? NSNumber, number.doubleValue > 0 {
+                    completion(true)
+                    return
+                }
+            }
+
+            for (key, value) in dict {
+                let keyDesc = String(describing: key)
+                if keyDesc.localizedCaseInsensitiveContains("Title")
+                    || keyDesc.localizedCaseInsensitiveContains("Artist")
+                    || keyDesc.localizedCaseInsensitiveContains("Album") {
+                    if let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        completion(true)
+                        return
+                    }
+                }
+            }
+
+            completion(false)
         }
     }
 
@@ -323,37 +641,67 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
             completion?()
             return
         }
-        detectNowPlayingState { playing, confident in
-            self.nowPlayingWasPlaying = playing
-
-            // Always issue pause once. Some players are controllable from Control Center
-            // but may not report the playing state through the old boolean API.
-            print("pause")
-            var pausedByCommand = self.sendNowPlayingCommand(MRCommandPause, name: "pause")
-            if !pausedByCommand {
-                pausedByCommand = self.sendNowPlayingCommand(MRCommandTogglePlayPause, name: "toggle")
-            }
-            if !pausedByCommand {
-                self.sendPlayPauseMediaKey()
-                pausedByCommand = true
-            }
-
-            if self.nowPlayingWasPlaying || !confident {
-                self.fallbackToggleNowPlaying(after: 0.35, expectPlaying: false)
-            }
-            if !self.nowPlayingWasPlaying && !confident && pausedByCommand {
-                print("Playback state uncertain; scheduling resume on unlock")
-                self.nowPlayingWasPlaying = true
-            }
-            Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false, block: { _ in
+        nowPlayingIconDetectedOnLock = false
+        nowPlayingWasPlaying = false
+        nowPlayingResumePendingFromUncertainState = false
+        detectNowPlayingIconVisibleWithRetry(context: "before lock", retries: 2, interval: 0.12) { iconVisible in
+            guard iconVisible else {
                 completion?()
-            })
+                return
+            }
+            self.nowPlayingIconDetectedOnLock = true
+
+            self.detectNowPlayingState { playing, confident in
+                self.nowPlayingWasPlaying = playing
+
+                // Always issue pause once. Some players are controllable from Control Center
+                // but may not report the playing state through the old boolean API.
+                print("pause")
+                var pausedByCommand = self.sendNowPlayingCommand(MRCommandPause, name: "pause")
+                if !pausedByCommand {
+                    pausedByCommand = self.sendNowPlayingCommand(MRCommandTogglePlayPause, name: "toggle")
+                }
+                if !pausedByCommand {
+                    self.sendPlayPauseMediaKey()
+                    pausedByCommand = true
+                }
+
+                if self.nowPlayingWasPlaying || !confident {
+                    self.fallbackToggleNowPlaying(after: 0.35, expectPlaying: false)
+                }
+                if !self.nowPlayingWasPlaying && !confident && pausedByCommand {
+                    self.nowPlayingResumePendingFromUncertainState = true
+                    print("Playback state uncertain; will try resume on unlock if menu icon is still visible.")
+                }
+                Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false, block: { _ in
+                    completion?()
+                })
+            }
         }
     }
     
     func playNowPlaying() {
         guard prefs.bool(forKey: "pauseItunes") else { return }
-        if nowPlayingWasPlaying {
+        guard nowPlayingIconDetectedOnLock else {
+            nowPlayingWasPlaying = false
+            nowPlayingResumePendingFromUncertainState = false
+            return
+        }
+        let shouldAttemptResume = nowPlayingWasPlaying || nowPlayingResumePendingFromUncertainState
+        guard shouldAttemptResume else {
+            nowPlayingIconDetectedOnLock = false
+            return
+        }
+
+        detectNowPlayingIconVisibleWithRetry(context: "before resume", retries: 5, interval: 0.2) { iconVisibleOnUnlock in
+            guard iconVisibleOnUnlock else {
+                print("Skip resume: Now Playing icon is not visible on unlock.")
+                self.nowPlayingWasPlaying = false
+                self.nowPlayingResumePendingFromUncertainState = false
+                self.nowPlayingIconDetectedOnLock = false
+                return
+            }
+
             print("play")
             Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false, block: { _ in
                 if !self.sendNowPlayingCommand(MRCommandPlay, name: "play") {
@@ -370,6 +718,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
                     }
                 })
                 self.nowPlayingWasPlaying = false
+                self.nowPlayingResumePendingFromUncertainState = false
+                self.nowPlayingIconDetectedOnLock = false
             })
         }
     }
@@ -579,7 +929,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemVa
                     self.runScript("intruded")
                 }
             }
-            if self.nowPlayingWasPlaying {
+            if self.nowPlayingWasPlaying || self.nowPlayingResumePendingFromUncertainState {
                 self.playNowPlaying()
             }
         })
